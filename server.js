@@ -1,124 +1,86 @@
-// DULLYVPN FIBER - Backend ndogo ya kuunganisha na Snippe API
-// Kazi: kuunda malipo, kupokea webhook, na ku-check status
+// DULLYVPN FIBER - Backend (webhook + metadata, hauitaji API Key)
 
 const express = require("express");
 const cors = require("cors");
+const crypto = require("crypto");
 
 const app = express();
 app.use(cors());
-app.use(express.json());
 
-const SNIPPE_API_KEY = process.env.SNIPPE_API_KEY; // wekwa Render Environment Variables
-const SNIPPE_BASE_URL = "https://api.snippe.sh/v1";
-
-// Hifadhi ya muda ya status za malipo (kwa mfumo mkubwa zaidi, tumia database)
-// key = reference, value = { status, package, createdAt }
+// Hifadhi ya muda ya status za malipo
+// key = client id (uliozalishwa na browser), value = { status, package, createdAt }
 const payments = {};
 
-// Ramani ya vifurushi -> bei (TZS)
-const PACKAGES = {
-  "dully-mini": { name: "MINI (Siku 1)", price: 500 },
-  "dully-lite": { name: "LITE (Siku 2)", price: 1000 },
-  "basic": { name: "BASIC (Siku 4)", price: 2000 },
-  "plus": { name: "PLUS (Wiki 1)", price: 3000 },
-  "premium": { name: "PREMIUM (Wiki 2)", price: 5000 },
-  "vip": { name: "VIP (Mwezi 1)", price: 10000 },
-};
+const SIGNING_KEY = process.env.SNIPPE_WEBHOOK_SECRET;
 
-// 1) Tengeneza malipo mapya na upate payment_url ya kumpeleka mteja
-app.post("/create-payment", async (req, res) => {
+function verifySignature(rawBody, headers) {
+  if (!SIGNING_KEY) return true; // ikiwa hujaweka secret bado, ruka ukaguzi (kwa majaribio tu)
+
+  const timestamp = headers["x-webhook-timestamp"];
+  const signature = headers["x-webhook-signature"];
+  if (!timestamp || !signature) return false;
+
+  const eventTime = parseInt(timestamp, 10);
+  const currentTime = Math.floor(Date.now() / 1000);
+  if (currentTime - eventTime > 300) return false;
+
+  const message = `${timestamp}.${rawBody}`;
+  const expected = crypto.createHmac("sha256", SIGNING_KEY).update(message).digest("hex");
+
   try {
-    const { packageId, phone, name } = req.body;
-
-    const pkg = PACKAGES[packageId];
-    if (!pkg) {
-      return res.status(400).json({ error: "Kifurushi hakijulikani" });
-    }
-
-    const response = await fetch(`${SNIPPE_BASE_URL}/payments`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${SNIPPE_API_KEY}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        payment_type: "mobile",
-        details: { amount: pkg.price, currency: "TZS" },
-        phone_number: phone,
-        customer: { name: name || "Mteja" },
-        webhook_url: `${process.env.PUBLIC_URL}/webhook`,
-        metadata: { package: packageId },
-      }),
-    });
-
-    const data = await response.json();
-
-    if (data.status !== "success") {
-      return res.status(400).json({ error: data.message || "Imeshindwa kuunda malipo" });
-    }
-
-    const reference = data.data.reference;
-
-    payments[reference] = {
-      status: "pending",
-      package: packageId,
-      createdAt: Date.now(),
-    };
-
-    res.json({
-      reference,
-      payment_url: data.data.payment_url || null,
-      status: "pending",
-    });
-
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "Hitilafu ya server" });
+    return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected));
+  } catch {
+    return false;
   }
-});
+}
 
-// 2) Snippe inatuma taarifa hapa pindi malipo yanapokamilika/kushindwa
-app.post("/webhook", (req, res) => {
+// Snippe inatuma taarifa hapa pindi malipo yanapokamilika/kushindwa
+app.post("/webhook", express.raw({ type: "*/*" }), (req, res) => {
   try {
-    const event = req.body;
+    const rawBody = req.body.toString();
 
-    // event.event => "payment.completed" au "payment.failed"
-    // event.data.reference => reference id ya malipo
-
-    const reference = event?.data?.reference;
-    if (!reference) return res.sendStatus(400);
-
-    if (!payments[reference]) {
-      payments[reference] = {};
+    if (!verifySignature(rawBody, req.headers)) {
+      console.log("Webhook signature isiyo sahihi");
+      return res.sendStatus(400);
     }
 
-    if (event.event === "payment.completed") {
-      payments[reference].status = "paid";
-    } else if (event.event === "payment.failed") {
-      payments[reference].status = "failed";
+    const event = JSON.parse(rawBody);
+    const eventType = event.type || event.event; // support format mpya na ya zamani
+    const data = event.data || event;
+
+    const urlMeta = data?.metadata?.url_metadata;
+    const clientId = urlMeta?.id;
+
+    if (!clientId) {
+      console.log("Webhook bila client id, tunapuuza");
+      return res.sendStatus(200);
     }
 
-    payments[reference].updatedAt = Date.now();
+    if (!payments[clientId]) payments[clientId] = {};
 
-    console.log("Webhook imepokelewa:", reference, payments[reference].status);
+    if (eventType === "payment.completed") {
+      payments[clientId].status = "paid";
+    } else if (eventType === "payment.failed" || eventType === "payment.voided" || eventType === "payment.expired") {
+      payments[clientId].status = "failed";
+    }
+
+    payments[clientId].updatedAt = Date.now();
+    console.log("Webhook:", clientId, payments[clientId].status);
 
     res.sendStatus(200);
-
   } catch (err) {
     console.error(err);
     res.sendStatus(500);
   }
 });
 
-// 3) Website inauliza status ya malipo kwa reference
-app.get("/status/:reference", (req, res) => {
-  const record = payments[req.params.reference];
+app.use(express.json());
 
-  if (!record) {
-    return res.status(404).json({ status: "haijulikani" });
-  }
-
-  res.json({ status: record.status });
+// Website inauliza status ya malipo kwa client id
+app.get("/status/:id", (req, res) => {
+  const record = payments[req.params.id];
+  if (!record) return res.json({ status: "pending" });
+  res.json({ status: record.status || "pending" });
 });
 
 app.get("/", (req, res) => {
